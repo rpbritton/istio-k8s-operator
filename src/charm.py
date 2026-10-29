@@ -616,6 +616,7 @@ class IstioCoreCharm(ops.CharmBase):
 
             resources = codecs.load_all_yaml(manifests, create_resources_for_crds=True)
             resources = self._patch_pebble_runtime(resources)
+            self._configure_ztunnel_trust(resources)
             if annotations.get(CNI_RECOVERY_ANNOTATION) == "true":
                 self._configure_recovered_cni(resources)
             resources = self._add_metrics_labels(resources)
@@ -623,6 +624,40 @@ class IstioCoreCharm(ops.CharmBase):
         krm = self._get_resource_manager(CONTROL_PLANE_LABEL)
         # TODO: A validating webhook raises a conflict if force=False.  Why?
         krm.reconcile(resources, force=True)  # pyright: ignore
+
+    def _configure_ztunnel_trust(self, resources: List[AnyResource]) -> None:
+        """Roll ztunnel when Istiod changes its startup-only CA trust."""
+        try:
+            config = self.lightkube_client.get(ConfigMap, "istio-ca-root-cert")
+        except ApiError as error:
+            if error.status.code != 404:
+                raise
+            LOGGER.info("Waiting for Istiod to publish its root certificate")
+            return
+        root = (config.data or {}).get("root-cert.pem")
+        if not root:
+            raise ValueError("ConfigMap/istio-ca-root-cert has no root-cert.pem")
+        for resource in resources:
+            if not (
+                isinstance(resource, DaemonSet)
+                and resource.metadata
+                and resource.metadata.name == "ztunnel"
+            ):
+                continue
+            if resource.spec is None or resource.spec.template.spec is None:
+                raise ValueError("Ztunnel manifest has no pod spec")
+            for container in resource.spec.template.spec.containers:
+                if container.name != "istio-proxy":
+                    continue
+                # Inline roots bind startup trust to the pod template, not a delayed volume update.
+                container.env = [
+                    env
+                    for env in container.env or []
+                    if env.name not in ("CA_ROOT_CA", "XDS_ROOT_CA")
+                ] + [
+                    EnvVar(name="CA_ROOT_CA", value=root),
+                    EnvVar(name="XDS_ROOT_CA", value=root),
+                ]
 
     @staticmethod
     def _configure_recovered_cni(resources: List[AnyResource]) -> None:

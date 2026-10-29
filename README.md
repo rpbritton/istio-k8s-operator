@@ -70,3 +70,11 @@ the node configuration. Normal installations keep their existing networking mode
 Back up mesh configuration before removing an old installation or model: their
 normal cleanup can delete CRDs and custom resources. Recovery preserves resources
 that still exist; it cannot restore data already removed during teardown.
+
+### Ztunnel trust updates
+
+Ztunnel loads its control-plane trust roots at startup. The charm includes Istiod's
+published root in the ztunnel pod template and reconciles it on `update-status`, so
+a changed root triggers a rollout rather than leaving ztunnel with stale trust.
+Handover can interrupt traffic until Istiod publishes its root and this rollout
+finishes.

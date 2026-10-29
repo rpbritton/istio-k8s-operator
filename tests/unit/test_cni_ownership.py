@@ -364,6 +364,7 @@ def test_reclaim_atomically_acquires_and_cleans_orphans_before_reconciliation(re
 def test_control_plane_only_uses_host_network_for_recovered_cni(cni_context, mocker, recovery):
     context, client, hooks = cni_context
     mocker.stop(hooks[5])
+    mocker.patch.object(IstioCoreCharm, "_configure_ztunnel_trust")
     if recovery:
         client.get.return_value.metadata.annotations = {CNI_RECOVERY_ANNOTATION: "true"}
     factory = mocker.patch.object(IstioCoreCharm, "_get_istioctl")
