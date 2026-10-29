@@ -9,12 +9,23 @@ from canonical_service_mesh.k8s.resource_manager import create_charm_default_lab
 from lightkube import ApiError
 from lightkube.models.meta_v1 import ObjectMeta
 from lightkube.models.rbac_v1 import RoleRef, Subject
-from lightkube.resources.core_v1 import ConfigMap, Pod
-from lightkube.resources.rbac_authorization_v1 import ClusterRoleBinding
+from lightkube.resources.admissionregistration_v1 import (
+    MutatingWebhookConfiguration,
+    ValidatingWebhookConfiguration,
+)
+from lightkube.resources.core_v1 import ConfigMap, Namespace, Pod
+from lightkube.resources.rbac_authorization_v1 import ClusterRole, ClusterRoleBinding
+from lightkube.types import PatchType
+from ops.testing import ActionFailed
 from scenario import Context, Model, State
 from scenario.errors import UncaughtCharmError
 
-from src.charm import CONTROL_PLANE_LABEL, IstioCoreCharm
+from src.charm import (
+    CNI_PREVIOUS_OWNER_ANNOTATION,
+    CNI_RECOVERY_ANNOTATION,
+    CONTROL_PLANE_LABEL,
+    IstioCoreCharm,
+)
 
 
 def cni_binding(namespace: str = "owner", application: str = "istio") -> ClusterRoleBinding:
@@ -240,3 +251,240 @@ def test_shutdown_timeout_keeps_ownership_claim(cni_context, mocker):
 
     assert isinstance(caught.value.__cause__, TimeoutError)
     client.delete.assert_not_called()
+
+
+@pytest.fixture()
+def reclaim_context(cni_context, mocker):
+    context, client, hooks = cni_context
+    binding = cni_binding("old-model")
+    binding.metadata.uid = "old-uid"
+    binding.metadata.resourceVersion = "42"
+    client.get.return_value = binding
+    client.create.side_effect = api_error(409, "AlreadyExists")
+
+    def get(resource, name):
+        if resource == Namespace:
+            raise api_error(404, "NotFound")
+        return client.get.return_value
+
+    def replace(replacement, **kwargs):
+        client.get.return_value = replacement
+        return replacement
+
+    client.get.side_effect = get
+    client.replace.side_effect = replace
+    manager = mocker.patch("src.charm.KubernetesResourceManager").return_value
+    manager.get_deployed_resources.return_value = []
+    return context, client, hooks, manager
+
+
+def test_orphan_status_identifies_owner_and_recovery(reclaim_context):
+    context, _, hooks, _ = reclaim_context
+
+    out = context.run(context.on.update_status(), State(leader=True, model=Model(name="owner")))
+
+    assert out.unit_status == ops.BlockedStatus(
+        "Orphaned Istio CNI owned by old-model-istio (namespace old-model); "
+        "run reclaim-cni binding-uid=old-uid"
+    )
+    for hook in hooks:
+        hook.assert_not_called()
+
+
+@pytest.mark.parametrize("terminating", [False, True], ids=["empty-namespace", "terminating-namespace"])
+def test_reclaim_refuses_existing_namespace(reclaim_context, terminating):
+    context, client, hooks, manager = reclaim_context
+    namespace = Namespace(metadata=ObjectMeta(name="old-model"))
+    if terminating:
+        namespace.metadata.deletionTimestamp = datetime.now(timezone.utc)
+    binding = client.get.return_value
+    client.get.side_effect = lambda resource, name: namespace if resource == Namespace else binding
+
+    with pytest.raises(ActionFailed, match="Previous owner namespace old-model still exists"):
+        context.run(
+            context.on.action("reclaim-cni", params={"binding-uid": "old-uid"}),
+            State(leader=True, model=Model(name="owner")),
+        )
+
+    client.replace.assert_not_called()
+    manager.get_deployed_resources.assert_not_called()
+    for hook in hooks:
+        hook.assert_not_called()
+
+
+def test_reclaim_atomically_acquires_and_cleans_orphans_before_reconciliation(reclaim_context, mocker):
+    context, client, hooks, manager = reclaim_context
+    factory = mocker.patch("src.charm.KubernetesResourceManager", return_value=manager)
+    orphan = ClusterRole(metadata=ObjectMeta(name="istiod-old-model"))
+    manager.get_deployed_resources.return_value = [orphan]
+
+    def check_cleanup():
+        client.delete.assert_called_once_with(
+            res=ClusterRole, name="istiod-old-model", namespace=None
+        )
+        client.patch.assert_called_once()
+
+    hooks[0].side_effect = check_cleanup
+    context.run(
+        context.on.action("reclaim-cni", params={"binding-uid": "old-uid"}),
+        State(leader=True, model=Model(name="owner")),
+    )
+
+    assert "ownership acquired" in context.action_results["message"]
+    replacement = client.replace.call_args.args[0]
+    assert replacement.metadata.uid == "old-uid"
+    assert replacement.metadata.resourceVersion == "42"
+    assert replacement.subjects == cni_binding().subjects
+    assert replacement.metadata.annotations == {
+        CNI_PREVIOUS_OWNER_ANNOTATION: "old-model-istio",
+        CNI_RECOVERY_ANNOTATION: "true",
+    }
+    assert factory.call_args.kwargs["resource_types"] == {
+        ClusterRole,
+        ClusterRoleBinding,
+        MutatingWebhookConfiguration,
+        ValidatingWebhookConfiguration,
+    }
+    client.patch.assert_called_once_with(
+        ClusterRoleBinding,
+        "istio-cni",
+        {
+            "metadata": {
+                "resourceVersion": "42",
+                "annotations": {CNI_PREVIOUS_OWNER_ANNOTATION: None},
+            }
+        },
+        patch_type=PatchType.MERGE,
+    )
+    for hook in hooks:
+        hook.assert_called_once()
+
+
+@pytest.mark.parametrize("recovery", [False, True], ids=["normal-installation", "orphan-recovery"])
+def test_control_plane_only_uses_host_network_for_recovered_cni(cni_context, mocker, recovery):
+    context, client, hooks = cni_context
+    mocker.stop(hooks[5])
+    if recovery:
+        client.get.return_value.metadata.annotations = {CNI_RECOVERY_ANNOTATION: "true"}
+    factory = mocker.patch.object(IstioCoreCharm, "_get_istioctl")
+    factory.return_value.manifest_generate.return_value = """
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: istio-cni-node
+spec:
+  selector:
+    matchLabels:
+      app: istio-cni-node
+  template:
+    metadata:
+      labels:
+        app: istio-cni-node
+    spec:
+      containers:
+        - name: install-cni
+          image: istio-install-cni
+          env:
+            - name: ALLOW_SWITCH_TO_HOST_NS
+              value: "true"
+"""
+    manager = mocker.patch.object(IstioCoreCharm, "_get_resource_manager").return_value
+
+    context.run(context.on.config_changed(), State(leader=True, model=Model(name="owner")))
+
+    spec = manager.reconcile.call_args.args[0][0].spec.template.spec
+    assert bool(spec.hostNetwork) == recovery
+    assert spec.dnsPolicy == ("ClusterFirstWithHostNet" if recovery else None)
+    assert bool(spec.containers[0].env) != recovery
+
+
+@pytest.mark.parametrize("code", [404, 409])
+def test_reclaim_loses_compare_and_swap_without_cleaning_or_reconciling(reclaim_context, code):
+    context, client, hooks, manager = reclaim_context
+    client.replace.side_effect = api_error(code, "Conflict")
+
+    with pytest.raises(ActionFailed, match="ownership changed during recovery"):
+        context.run(
+            context.on.action("reclaim-cni", params={"binding-uid": "old-uid"}),
+            State(leader=True, model=Model(name="owner")),
+        )
+    manager.get_deployed_resources.assert_not_called()
+    client.delete.assert_not_called()
+    for hook in hooks:
+        hook.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", ["uid", "missing", "terminating", "subjects", "role", "labels"])
+def test_reclaim_refuses_unrecognised_or_changed_binding(reclaim_context, invalid):
+    context, client, hooks, _ = reclaim_context
+    binding = client.get.return_value
+    if invalid == "uid":
+        binding.metadata.uid = "different-uid"
+    elif invalid == "missing":
+        client.get.return_value = None
+    elif invalid == "terminating":
+        binding.metadata.deletionTimestamp = datetime.now(timezone.utc)
+    elif invalid == "subjects":
+        binding.subjects = []
+    elif invalid == "role":
+        binding.roleRef.name = "unexpected"
+    else:
+        binding.metadata.labels = {}
+
+    with pytest.raises(ActionFailed):
+        context.run(
+            context.on.action("reclaim-cni", params={"binding-uid": "old-uid"}),
+            State(leader=True, model=Model(name="owner")),
+        )
+
+    client.replace.assert_not_called()
+    client.delete.assert_not_called()
+    for hook in hooks:
+        hook.assert_not_called()
+
+
+@pytest.mark.parametrize("code", [403, 500])
+def test_namespace_lookup_errors_do_not_allow_recovery(reclaim_context, code):
+    context, client, hooks, _ = reclaim_context
+    error = api_error(code, "Unavailable")
+
+    def get(resource, name):
+        if resource == Namespace:
+            raise error
+        return client.get.return_value
+
+    client.get.side_effect = get
+
+    with pytest.raises(UncaughtCharmError) as caught:
+        context.run(
+            context.on.action("reclaim-cni", params={"binding-uid": "old-uid"}),
+            State(leader=True, model=Model(name="owner")),
+        )
+
+    assert caught.value.__cause__ is error
+    client.replace.assert_not_called()
+    for hook in hooks:
+        hook.assert_not_called()
+
+
+def test_orphan_cleanup_failure_retains_claim_and_periodic_reconcile_retries(reclaim_context):
+    context, client, hooks, manager = reclaim_context
+    manager.get_deployed_resources.side_effect = api_error(500, "InternalError")
+    state = State(leader=True, model=Model(name="owner"))
+
+    with pytest.raises(UncaughtCharmError):
+        context.run(context.on.action("reclaim-cni", params={"binding-uid": "old-uid"}), state)
+
+    assert client.get.return_value.metadata.annotations[CNI_PREVIOUS_OWNER_ANNOTATION]
+    client.patch.assert_not_called()
+    for hook in hooks:
+        hook.assert_not_called()
+
+    manager.get_deployed_resources.side_effect = None
+    manager.get_deployed_resources.return_value = []
+    context.run(context.on.update_status(), state)
+
+    assert client.replace.call_count == 1
+    client.patch.assert_called_once()
+    for hook in hooks:
+        hook.assert_called_once()

@@ -61,6 +61,20 @@ assumes:
   - k8s-api
   - juju >= 3.6
 
+actions:
+  reclaim-cni:
+    description: |
+      Recover an orphaned Istio CNI binding after removing its previous installation
+      and model. The previous namespace must no longer exist, even if it has no pods.
+      Removes the previous owner's labelled cluster-scoped control-plane RBAC and
+      webhooks before reconciliation. Preserves CRDs and mesh custom resources.
+      This is a disruptive recovery operation, not support for parallel installations.
+    params:
+      binding-uid:
+        type: string
+        description: UID of ClusterRoleBinding/istio-cni inspected before recovery.
+    required: [binding-uid]
+
 platforms:
   ubuntu@24.04:amd64:
   #ubuntu@24.04:arm64:

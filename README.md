@@ -29,7 +29,7 @@ This deploys the Istio control plane, which can then be used by anything in the 
 * [istio-ingress-k8s](https://github.com/canonical/istio-ingress-k8s-operator) to create ingresses to the cluster
 * for general Istio guidance, see the [Istio docs](https://istio.io/latest/docs/), for example [how to deploy an application to an Istio ambient mesh](https://istio.io/latest/docs/ambient/getting-started/deploy-sample-app/)
 
-### CNI ownership
+### CNI ownership and recovery
 
 Only one independent Istio installation is supported per cluster. The charm claims
 `ClusterRoleBinding/istio-cni` atomically before modifying shared resources. Another
@@ -41,5 +41,32 @@ Remove the previous installation normally whenever possible. A blocked contender
 automatically retries when ownership is released. Do not delete the binding while
 the previous installation is running or terminating.
 
-Unrecognised or abandoned bindings require manual investigation. An absent pod is
-not proof that ownership is available: the claim is created before the control plane.
+If an installation was removed without cleaning up its cluster-scoped resources,
+the new charm reports an orphaned binding. After removing the old installation and
+its Juju model, inspect the binding and explicitly reclaim it:
+
+```bash
+kubectl get clusterrolebinding istio-cni -o yaml
+juju run istio/leader reclaim-cni binding-uid=<metadata.uid>
+```
+
+Recovery refuses while the previous namespace exists, including when it is empty
+or terminating. No pods is not proof of abandonment: a controller can recreate them,
+and a new owner claims the binding before creating its pods. Do not recreate the old
+installation or namespace during recovery. Unrecognised or unlabelled bindings
+require manual investigation rather than automatic adoption.
+
+The action uses the binding's resource version so competing recovery requests cannot
+both acquire it. Once acquired, it removes the previous owner's labelled cluster-scoped
+control-plane RBAC and webhooks, then reconciles the new installation. CRDs and mesh
+custom resources are preserved. Cleanup failures retain the claim and are retried by
+subsequent reconciliation. Check Juju status and mesh traffic after recovery; acquiring
+ownership alone does not establish workload or endpoint health.
+
+Recovered installations use Istio's host-network mode for the CNI agent, so stale
+node-local CNI credentials cannot prevent its replacement from starting and repairing
+the node configuration. Normal installations keep their existing networking mode.
+
+Back up mesh configuration before removing an old installation or model: their
+normal cleanup can delete CRDs and custom resources. Recovery preserves resources
+that still exist; it cannot restore data already removed during teardown.

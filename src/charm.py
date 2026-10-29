@@ -54,7 +54,7 @@ from lightkube.resources.admissionregistration_v1 import (
 from lightkube.resources.apiextensions_v1 import CustomResourceDefinition
 from lightkube.resources.apps_v1 import DaemonSet, Deployment
 from lightkube.resources.autoscaling_v2 import HorizontalPodAutoscaler
-from lightkube.resources.core_v1 import ConfigMap, Pod, Service, ServiceAccount
+from lightkube.resources.core_v1 import ConfigMap, Namespace, Pod, Service, ServiceAccount
 from lightkube.resources.policy_v1 import PodDisruptionBudget
 from lightkube.resources.rbac_authorization_v1 import (
     ClusterRole,
@@ -62,6 +62,7 @@ from lightkube.resources.rbac_authorization_v1 import (
     Role,
     RoleBinding,
 )
+from lightkube.types import PatchType
 from ops.pebble import ChangeError, Layer
 
 from config import CharmConfig
@@ -74,6 +75,8 @@ SOURCE_PATH = Path(__file__).parent
 CONTROL_PLANE_COMPONENTS = ["pilot", "cni", "ztunnel"]
 CONTROL_PLANE_LABEL = "control-plane"
 CNI_CLUSTER_ROLE_BINDING = "istio-cni"
+CNI_PREVIOUS_OWNER_ANNOTATION = "istio.juju.is/previous-cni-owner"
+CNI_RECOVERY_ANNOTATION = "istio.juju.is/reclaimed-cni"
 CONTROL_PLANE_TERMINATION_TIMEOUT = 60
 CONTROL_PLANE_RESOURCE_TYPES = {
     ClusterRole,
@@ -175,6 +178,7 @@ class IstioCoreCharm(ops.CharmBase):
         self.framework.observe(self.on.start, self._reconcile)
         self.framework.observe(self.on.update_status, self._reconcile)
         self.framework.observe(self.on.remove, self._remove)
+        self.framework.observe(self.on.reclaim_cni_action, self._on_reclaim_cni)
         self.framework.observe(self.on.metrics_proxy_pebble_ready, self._reconcile)
         self.framework.observe(self.workload_tracing.on.endpoint_changed, self._reconcile)
         self.framework.observe(self.workload_tracing.on.endpoint_removed, self._reconcile)
@@ -315,6 +319,7 @@ class IstioCoreCharm(ops.CharmBase):
         binding = self._get_cni_binding()
         if binding is None or not self._owns_cni_binding(binding):
             return
+        self._cleanup_previous_cni_owner(binding)
 
         # Keep the ownership claim until all other resource groups have been deleted.
         for name in self._resource_manager_factories:
@@ -408,9 +413,19 @@ class IstioCoreCharm(ops.CharmBase):
                     "Unrecognised Istio CNI owner; inspect ClusterRoleBinding/istio-cni"
                 )
             owner = f"{instance} (namespace {namespace})"
+            if self._namespace_exists(namespace):
+                return ops.BlockedStatus(
+                    f"Istio CNI owned by {owner}; remove the other installation first"
+                )
             return ops.BlockedStatus(
-                f"Istio CNI owned by {owner}; remove the other installation first"
+                f"Orphaned Istio CNI owned by {owner}; "
+                f"run reclaim-cni binding-uid={binding.metadata.uid if binding.metadata else ''}"
             )
+        if (
+            binding.metadata
+            and (binding.metadata.annotations or {}).get(CNI_PREVIOUS_OWNER_ANNOTATION)
+        ):
+            return ops.WaitingStatus("Cleaning previous Istio CNI owner resources")
         return None
 
     def _cni_owner_namespace(self, binding: ClusterRoleBinding) -> str | None:
@@ -422,6 +437,117 @@ class IstioCoreCharm(ops.CharmBase):
             return None
         return subject.namespace
 
+    def _namespace_exists(self, namespace: str) -> bool:
+        """Treat terminating namespaces as occupied, not abandoned."""
+        try:
+            self.lightkube_client.get(Namespace, namespace)
+        except ApiError as error:
+            if error.status.code != 404:
+                raise
+            return False
+        return True
+
+    def _on_reclaim_cni(self, event: ops.ActionEvent) -> None:
+        """Explicitly recover an orphaned claim without racing another recovery."""
+        if not self.unit.is_leader() or self.app.planned_units() < 1:
+            event.fail("Run this action on the leader of a non-removing application")
+            return
+        binding = self._get_cni_binding()
+        if (
+            binding is None
+            or binding.metadata is None
+            or binding.metadata.uid != event.params["binding-uid"]
+            or binding.metadata.deletionTimestamp
+        ):
+            event.fail("CNI binding is missing, terminating, or its UID changed; inspect it again")
+            return
+        if not self._owns_cni_binding(binding):
+            namespace = self._cni_owner_namespace(binding)
+            labels = binding.metadata.labels or {}
+            previous_owner = labels.get("app.kubernetes.io/instance")
+            if (
+                namespace is None
+                or not previous_owner
+                or labels.get("kubernetes-resource-handler-scope") != CONTROL_PLANE_LABEL
+                or not binding.metadata.resourceVersion
+            ):
+                event.fail("Unrecognised CNI ownership; inspect the binding and recover manually")
+                return
+            if self._namespace_exists(namespace):
+                event.fail(
+                    f"Previous owner namespace {namespace} still exists (possibly terminating); "
+                    "remove the previous installation and its model before reclaiming"
+                )
+                return
+            replacement = self._cni_binding
+            replacement.metadata = ObjectMeta(
+                name=CNI_CLUSTER_ROLE_BINDING,
+                uid=binding.metadata.uid,
+                resourceVersion=binding.metadata.resourceVersion,
+                labels=replacement.metadata.labels if replacement.metadata else {},
+                annotations={
+                    CNI_PREVIOUS_OWNER_ANNOTATION: previous_owner,
+                    CNI_RECOVERY_ANNOTATION: "true",
+                },
+            )
+            try:
+                self.lightkube_client.replace(
+                    replacement, field_manager=f"{self.app.name}-cni-ownership"
+                )
+            except ApiError as error:
+                if error.status.code not in (404, 409):
+                    raise
+                event.fail("CNI ownership changed during recovery; inspect the binding and retry")
+                return
+        self._reconcile(event)
+        current = self._get_cni_binding()
+        if current is None or not self._owns_cni_binding(current):
+            event.fail("CNI ownership changed before reconciliation; inspect the binding and retry")
+            return
+        event.set_results({"message": "CNI ownership acquired; check status for workload readiness"})
+
+    def _cleanup_previous_cni_owner(self, binding: ClusterRoleBinding) -> None:
+        """Resume orphan cleanup after a failed action without deleting CRDs or mesh data."""
+        annotations = (binding.metadata.annotations or {}) if binding.metadata else {}
+        previous_owner = annotations.get(CNI_PREVIOUS_OWNER_ANNOTATION)
+        if not previous_owner:
+            return
+        manager = KubernetesResourceManager(
+            labels={
+                "app.kubernetes.io/instance": previous_owner,
+                "kubernetes-resource-handler-scope": CONTROL_PLANE_LABEL,
+            },
+            resource_types={
+                ClusterRole,
+                ClusterRoleBinding,
+                MutatingWebhookConfiguration,
+                ValidatingWebhookConfiguration,
+            },
+            lightkube_client=self.lightkube_client,
+            logger=LOGGER,
+        )
+        resources = [
+            resource
+            for resource in manager.get_deployed_resources()
+            if not (
+                isinstance(resource, ClusterRoleBinding)
+                and resource.metadata
+                and resource.metadata.name == CNI_CLUSTER_ROLE_BINDING
+            )
+        ]
+        delete_many(self.lightkube_client, resources, logger=LOGGER)
+        self.lightkube_client.patch(
+            ClusterRoleBinding,
+            CNI_CLUSTER_ROLE_BINDING,
+            {
+                "metadata": {
+                    "resourceVersion": binding.metadata.resourceVersion if binding.metadata else None,
+                    "annotations": {CNI_PREVIOUS_OWNER_ANNOTATION: None},
+                }
+            },
+            patch_type=PatchType.MERGE,
+        )
+
     def _claim_cni_ownership(self) -> bool:
         """Use Kubernetes create, not apply, to arbitrate concurrent installations."""
         try:
@@ -430,7 +556,9 @@ class IstioCoreCharm(ops.CharmBase):
             if error.status.reason != "AlreadyExists":
                 raise
             binding = self._get_cni_binding()
-            return binding is not None and self._owns_cni_binding(binding)
+            if binding is None or not self._owns_cni_binding(binding):
+                return False
+            self._cleanup_previous_cni_owner(binding)
         return True
 
     # Properties
@@ -464,6 +592,8 @@ class IstioCoreCharm(ops.CharmBase):
 
     def _reconcile_control_plane(self):
         """Reconcile the control plane resources."""
+        binding = self._get_cni_binding()
+        annotations = (binding.metadata.annotations or {}) if binding and binding.metadata else {}
         ictl = self._get_istioctl()
         resources = []
         unit_count = self.model.app.planned_units()
@@ -486,11 +616,34 @@ class IstioCoreCharm(ops.CharmBase):
 
             resources = codecs.load_all_yaml(manifests, create_resources_for_crds=True)
             resources = self._patch_pebble_runtime(resources)
+            if annotations.get(CNI_RECOVERY_ANNOTATION) == "true":
+                self._configure_recovered_cni(resources)
             resources = self._add_metrics_labels(resources)
 
         krm = self._get_resource_manager(CONTROL_PLANE_LABEL)
         # TODO: A validating webhook raises a conflict if force=False.  Why?
         krm.reconcile(resources, force=True)  # pyright: ignore
+
+    @staticmethod
+    def _configure_recovered_cni(resources: List[AnyResource]) -> None:
+        """Start the replacement agent independently of stale node CNI credentials."""
+        for resource in resources:
+            if not (
+                isinstance(resource, DaemonSet)
+                and resource.metadata
+                and resource.metadata.name == "istio-cni-node"
+            ):
+                continue
+            if resource.spec is None or resource.spec.template.spec is None:
+                raise ValueError("Istio CNI manifest has no pod spec")
+            spec = resource.spec.template.spec
+            spec.hostNetwork = True
+            spec.dnsPolicy = "ClusterFirstWithHostNet"
+            for container in spec.containers:
+                if container.env:
+                    container.env = [
+                        env for env in container.env if env.name != "ALLOW_SWITCH_TO_HOST_NS"
+                    ]
 
     def _construct_hpa(self, unit_count: int) -> HorizontalPodAutoscaler:
         """Construct a HorizontalPodAutoscaler resource for istiod with required custom specs.
